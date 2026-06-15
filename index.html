@@ -1026,22 +1026,22 @@ svg.leaflet-image-layer.leaflet-interactive path {
     }
     #data-loader.hidden { display: none; }
     .data-panel {
-      width: min(760px, 100%); background: #fff; border: 1px solid #dfe3e8;
+      width: min(360px, 100%); background: #fff; border: 1px solid #dfe3e8;
       border-radius: 10px; box-shadow: 0 14px 36px rgba(0,0,0,.12);
-      padding: 18px; display: flex; flex-direction: column; gap: 12px;
+      padding: 18px; display: flex; flex-direction: column; gap: 14px;
     }
     .data-title { font-size: 18px; font-weight: 700; }
-    #data-input {
-      width: 100%; min-height: 220px; resize: vertical; border: 1px solid #d0d5dd;
-      border-radius: 8px; padding: 12px; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
-      line-height: 1.45; outline: none;
+    #data-password {
+      width: 100%; border: 1px solid #d0d5dd; border-radius: 8px;
+      padding: 10px 12px; font-size: 15px; outline: none;
     }
-    #data-input:focus { border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26,115,232,.12); }
-    .data-actions { display: flex; align-items: center; gap: 12px; }
+    #data-password:focus { border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26,115,232,.12); }
+    .data-actions { display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
     #data-load {
       border: 0; border-radius: 8px; padding: 10px 18px;
-      background: #1a73e8; color: #fff; font-weight: 700; cursor: pointer;
+      font-weight: 700; cursor: pointer;
     }
+    #data-load { background: #1a73e8; color: #fff; }
     #data-load:disabled { opacity: .55; cursor: default; }
     #data-status { color: #666; font-size: 13px; min-height: 18px; }
 
@@ -1117,10 +1117,10 @@ svg.leaflet-image-layer.leaflet-interactive path {
 
     <div id="data-loader" role="dialog" aria-modal="true">
     <div class="data-panel">
-      <div class="data-title">데이터 붙여넣기</div>
-      <textarea id="data-input" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="base64 데이터를 붙여넣으세요"></textarea>
+      <div class="data-title">데이터 불러오기</div>
+      <input id="data-password" type="password" autocomplete="current-password" placeholder="비밀번호">
       <div class="data-actions">
-        <button id="data-load" type="button">입장</button>
+        <button id="data-load" type="button">불러오기</button>
         <div id="data-status" aria-live="polite"></div>
       </div>
     </div>
@@ -1204,8 +1204,40 @@ svg.leaflet-image-layer.leaflet-interactive path {
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       return bytes;
     }
-    function decodePayload(input) {
-      const compressed = base64ToBytes(input);
+    const ENCRYPTED_MAGIC = "TS2E1";
+    const ENCRYPTED_SALT_BYTES = 16;
+    const ENCRYPTED_IV_BYTES = 12;
+    const ENCRYPTED_PBKDF2_ITERATIONS = 210000;
+    async function decryptPayload(input, password) {
+      if (!window.crypto || !crypto.subtle) throw new Error("복호화를 사용할 수 없는 브라우저입니다.");
+      const envelope = base64ToBytes(input);
+      const magic = String.fromCharCode(...envelope.subarray(0, ENCRYPTED_MAGIC.length));
+      if (magic !== ENCRYPTED_MAGIC) throw new Error("암호화된 데이터 형식이 아닙니다.");
+      const saltStart = ENCRYPTED_MAGIC.length;
+      const ivStart = saltStart + ENCRYPTED_SALT_BYTES;
+      const dataStart = ivStart + ENCRYPTED_IV_BYTES;
+      if (envelope.length <= dataStart + 16) throw new Error("암호화된 데이터가 손상되었습니다.");
+      const passwordBytes = new TextEncoder().encode(password);
+      const keyMaterial = await crypto.subtle.importKey("raw", passwordBytes, "PBKDF2", false, ["deriveKey"]);
+      const key = await crypto.subtle.deriveKey(
+        { name: "PBKDF2", salt: envelope.subarray(saltStart, ivStart), iterations: ENCRYPTED_PBKDF2_ITERATIONS, hash: "SHA-256" },
+        keyMaterial,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["decrypt"]
+      );
+      try {
+        return new Uint8Array(await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: envelope.subarray(ivStart, dataStart) },
+          key,
+          envelope.subarray(dataStart)
+        ));
+      } catch (_) {
+        throw new Error("비밀번호가 틀렸거나 데이터가 손상되었습니다.");
+      }
+    }
+    async function decodePayload(input, password) {
+      const compressed = await decryptPayload(input, password);
       const json = fflate.strFromU8(fflate.gunzipSync(compressed));
       return unpackData(JSON.parse(json));
     }
@@ -1223,36 +1255,73 @@ svg.leaflet-image-layer.leaflet-interactive path {
       if (init()) { setupLocate(); setupChipToggles(); setupModeTabs(); }
     }
     function setupDataLoader() {
-      const input = document.getElementById("data-input");
+      const passwordInput = document.getElementById("data-password");
       const button = document.getElementById("data-load");
       const status = document.getElementById("data-status");
-      let timer = null;
       function setBusy(isBusy) {
         button.disabled = isBusy;
+        passwordInput.disabled = isBusy;
         status.textContent = isBusy ? "불러오는 중..." : "";
       }
-      function loadNow() {
-        if (appStarted) return;
-        const raw = input.value;
-        if (!raw.trim()) return;
-        setBusy(true);
-        setTimeout(() => {
-          try { startApp(decodePayload(raw)); }
-          catch (error) {
-            button.disabled = false;
-            status.textContent = error && error.message ? error.message : "데이터를 읽을 수 없습니다.";
-          }
-        }, 20);
+      function looksLikePayload(text) {
+        const payload = extractPayload(text);
+        return payload.length > 1000 && /^[A-Za-z0-9_-]+$/.test(payload);
       }
-      input.addEventListener("paste", () => setTimeout(loadNow, 0));
-      input.addEventListener("input", () => {
-        clearTimeout(timer);
-        if (input.value.trim().length > 1000) timer = setTimeout(loadNow, 180);
+      async function loadPayload(raw) {
+        if (appStarted) return;
+        const password = passwordInput.value;
+        if (!password) {
+          status.textContent = "비밀번호를 입력하세요.";
+          passwordInput.focus();
+          return;
+        }
+        if (!raw.trim()) {
+          status.textContent = "클립보드에 데이터가 없습니다.";
+          return;
+        }
+        setBusy(true);
+        await new Promise(resolve => setTimeout(resolve, 20));
+        try { startApp(await decodePayload(raw, password)); }
+        catch (error) {
+          button.disabled = false;
+          passwordInput.disabled = false;
+          status.textContent = error && error.message ? error.message : "데이터를 읽을 수 없습니다.";
+        }
+      }
+      async function loadFromClipboard() {
+        if (appStarted) return;
+        if (!passwordInput.value) {
+          status.textContent = "비밀번호를 입력하세요.";
+          passwordInput.focus();
+          return;
+        }
+        if (!navigator.clipboard || !navigator.clipboard.readText) {
+          status.textContent = "클립보드 읽기를 사용할 수 없습니다.";
+          return;
+        }
+        setBusy(true);
+        try {
+          const text = await navigator.clipboard.readText();
+          if (!looksLikePayload(text)) {
+            button.disabled = false;
+            passwordInput.disabled = false;
+            status.textContent = "클립보드에 데이터가 없습니다.";
+            return;
+          }
+          await loadPayload(text);
+        } catch (_) {
+          button.disabled = false;
+          passwordInput.disabled = false;
+          status.textContent = "브라우저가 클립보드 읽기를 막았습니다.";
+        }
+      }
+      button.addEventListener("click", loadFromClipboard);
+      passwordInput.addEventListener("keydown", event => {
+        if (event.key === "Enter") loadFromClipboard();
       });
-      button.addEventListener("click", loadNow);
       const urlPayload = new URLSearchParams(location.search).get("d") || new URLSearchParams(location.hash.replace(/^#/, "")).get("d");
-      if (urlPayload) { input.value = urlPayload; loadNow(); }
-      else { input.focus(); }
+      if (urlPayload) loadPayload(urlPayload);
+      else passwordInput.focus();
     }
 
     function deriveInstalledMerchants(locations) {
